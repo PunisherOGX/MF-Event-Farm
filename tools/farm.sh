@@ -5,12 +5,14 @@
 #   ./farm.sh stop     stop cleanly at the next play boundary
 cd "$(dirname "$0")" || exit 1
 
-# Resolve the interpreter. Order: an explicit MUT_PY, the repo's venv/ (see
-# README), a venv inside tools/, then whatever python3 is on PATH.
+# Resolve the interpreter. Order: an explicit MUT_PY, this repo's venv, then a
+# sibling qenv, then whatever python3 is on PATH.
 resolve_py() {
-  # We have already cd'd into the script's directory, so use PWD.
+  # ⛔ We have already cd'd into the script's directory, so use PWD.
+  # "$(dirname "$0")" here would resolve against the NEW cwd and point at a
+  # directory that does not exist.
   local here; here="$PWD"
-  for c in "$MUT_PY" "$here/../venv/bin/python" "$here/venv/bin/python" \
+  for c in "$MUT_PY" "$here/../venv/bin/python" "$here/qenv/bin/python" \
            "$(command -v python3)"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }
   done
@@ -18,9 +20,11 @@ resolve_py() {
 }
 PY="$(resolve_py)"
 if [ -z "$PY" ]; then
-  echo "No python found. Create the venv (see README)." >&2
+  echo "No python found. Run ./setup.sh first." >&2
   exit 1
 fi
+
+export MUT_PAD_REMOTE=local
 
 # `farm.sh stop` is the clean way to stop: the loop checks for this file at a
 # play boundary. A bare pkill can land mid-play, after the snap.
@@ -47,8 +51,8 @@ rm -f /tmp/mut-event/stop
 ping -c 1 -t 2 "${MUT_PS5_HOST:-192.168.1.100}" >/dev/null 2>&1 \
   || { echo "PS5 UNREACHABLE - not starting"; exit 1; }
 
-# A HALT (the loop stopped on something it could not handle) is not something a
-# restart may step over. Clearing it is a deliberate act.
+# A HALT (a loss, with MUT_EVENT_HALT_ANY_LOSS=1) is not something a restart may
+# step over. Clearing it is a deliberate act.
 if [ -f /tmp/mut-event/HALT ]; then
   echo ""
   echo "⛔ FARM HALTED:"
@@ -62,6 +66,7 @@ fi
 pgrep -f "grind.py loop" >/dev/null && { echo "already running"; exit 0; }
 
 LOG=/tmp/mut-event/grind-$(date +%Y%m%d).log
+mkdir -p /tmp/mut-event
 { echo ""; echo "===== farm started $(date '+%Y-%m-%d %H:%M:%S') ====="; } >> "$LOG"
 ln -sf "$LOG" /tmp/mut-event/grind.log
 nohup "$PY" -u grind.py loop 99999 >> "$LOG" 2>&1 &

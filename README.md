@@ -207,6 +207,32 @@ or lose a run by hand, fix the ledger with `keys.py set` before restarting.
 | `~/.mut_event_calibration.json` | the `calibrate.py verify` stamp |
 | `/tmp/mut-event/` | logs, HALT / ALERT / ALERT.STICKY / FROZEN files, `stuck/` screenshots for anything it could not handle |
 
+## Recent changes (Oct 17-18)
+
+- **Stat tickers are never read as scores.** A HUD band containing RUSH/YDS/
+  REC/TKL/... words is skipped, so "3 RUSHES 41 YDS" can't become 3-41.
+- **Offensive playcall with no tab strip yet** waits for 3 reads before backing
+  out with circle (it used to back out of a screen that was still drawing).
+- **Games are labelled with the event they were played in**, so a game that
+  finishes after the bot walks into the next event is still booked to the right
+  one. The score-reader "GAME LOST" alert is no longer sticky: the progress
+  screen is the truth.
+- **"YOUR | REWARDS" split by OCR** is re-joined, so the key pack on the
+  rewards screen is opened instead of skipped.
+- **Key picker**: only rejects a read that names a *different* key (a misread
+  "150" as "60" no longer aborts entry).
+- **Candy tracking**: counted from results, not the on-screen total (which
+  moves with spending): 2,000 per L3 completion, 2,500 per L4 game-1 win.
+  `./keys.py` prints it.
+- **A Madden crash mid-game ends the run** (it counts as a loss). The farm can't
+  relaunch Madden: kill it, dismiss the PS5 error, relaunch, go to the MF
+  events tile, restart.
+
+Record with this setup (Inside Zone until winning, FB Dive Weak once ahead,
+Mid Blitz): L3 103-8, L4 game 1 30-3 since Oct 16.
+
+---
+
 ## Good to know
 
 - **Look at the screen before changing code.** `calibrate.py shot` shows

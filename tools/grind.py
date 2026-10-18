@@ -12,6 +12,7 @@ Event settings live in config.py, reading in screen.py / hud.py, pressing in
 actions.py. This file is the loop and the between-game menus.
 
     ./grind.py loop [max_plays]   the farm (use farm.sh, which logs it)
+    ./grind.py menus|event|lineup|chew|off|def   one step, for testing
 """
 import atexit
 import functools
@@ -48,6 +49,7 @@ os.makedirs(C.STUCK_DIR, exist_ok=True)
 
 CURRENT_RECORD = None      # the event card's W-L, e.g. "3-0"
 CURRENT_BADGE = None       # ARCADE / COMP, read off the HUD during a play
+LOSSES_SEEN = None         # last "N/1 LOSSES" count (only used with HALT_ON_ANY_LOSS)
 # Most Feared: the key number of the event whose run is in progress (None =
 # pick a new one from the ledger), and the event whose completion has paid a
 # next-level key we have not yet read off a reward screen.
@@ -84,16 +86,19 @@ def _save_state():
     try:
         with open(C.STATE_FILE, "w") as fh:
             json.dump({"record": CURRENT_RECORD, "badge": CURRENT_BADGE,
-                       "event": CURRENT_EVENT,
+                       "losses_seen": LOSSES_SEEN, "event": CURRENT_EVENT,
                        "awaiting_key_from": AWAITING_KEY_FROM,
                        "finishing": FINISHING,
-                       "quit_pending": QUIT_PENDING}, fh)
+                       "quit_pending": QUIT_PENDING,
+                       # Survives restarts so a re-read progress screen is not
+                       # counted twice in the loop record (Oct 16).
+                       "last_counts": LAST_COUNTS}, fh)
     except OSError:
         pass
 
 
 def _load_state():
-    global CURRENT_RECORD, CURRENT_BADGE
+    global CURRENT_RECORD, CURRENT_BADGE, LOSSES_SEEN
     global CURRENT_EVENT, AWAITING_KEY_FROM, FINISHING, QUIT_PENDING
     try:
         with open(C.STATE_FILE) as fh:
@@ -102,8 +107,11 @@ def _load_state():
         AWAITING_KEY_FROM = d.get("awaiting_key_from")
         FINISHING = d.get("finishing")
         QUIT_PENDING = bool(d.get("quit_pending"))
+        LAST_COUNTS.update({k: tuple(v) for k, v in
+                            (d.get("last_counts") or {}).items()})
         CURRENT_RECORD = d.get("record")
         CURRENT_BADGE = d.get("badge")
+        LOSSES_SEEN = d.get("losses_seen")
     except (OSError, ValueError):
         pass
 
@@ -246,6 +254,7 @@ def _has(txt, *needles):
     return all(n.upper() in txt for n in needles)
 
 
+_HOUSE_NUM = re.compile(r"(MURKWATER|CATACOMB|PHANTASMAL|ABYSSAL)\D{0,24}?(\d{2,5})")
 _CARD_BUTTONS = ("JOIN EVENT", "CONTINUE", "START", "FINISH EVENT")
 
 
@@ -257,6 +266,17 @@ def _key_from_digits(digits):
     return None
 
 
+def _cards(txt):
+    """[(key, text up to the next card)] in screen order."""
+    hits = [(m, _key_from_digits(m.group(2))) for m in _HOUSE_NUM.finditer(txt)]
+    hits = [(m, k) for m, k in hits if k]
+    out = []
+    for j, (m, k) in enumerate(hits):
+        end = hits[j + 1][0].start() if j + 1 < len(hits) else len(txt)
+        out.append((k, txt[m.end():end]))
+    return out
+
+
 def current_level():
     return keys.level(CURRENT_EVENT) if CURRENT_EVENT else None
 
@@ -264,9 +284,17 @@ def current_level():
 LEADING = False   # set by the play loop from the confirmed score
 
 
+def trailing_key():
+    lv = current_level() or 1
+    if lv in C.OFFENSE_TRAILING_BY_LEVEL:
+        return C.OFFENSE_TRAILING_BY_LEVEL[lv]
+    return (C.OFFENSE_TRAILING_HI if lv >= C.OFFENSE_HI_FROM_LEVEL
+            else C.OFFENSE_TRAILING)
+
+
 def current_offense():
-    """Not winning: INSIDE ZONE; winning: FB DIVE WEAK (config.OFFENSE_*)."""
-    return C.PLAYS[C.OFFENSE_LEADING if LEADING else C.OFFENSE_TRAILING]
+    """Not winning: jet (L1) / inside zone (L2+); winning: FB dive."""
+    return C.PLAYS[C.OFFENSE_LEADING if LEADING else trailing_key()]
 
 
 def enter_event(log=print, tries=24):
@@ -348,6 +376,11 @@ def enter_event(log=print, tries=24):
             AWAITING_KEY_FROM = fk
             _save_state()
             log(f"    events: {keys.label(fk)} shows FINISH EVENT - cashing it")
+        if button == "FINISH EVENT" and C.PAUSE_AT_LEVEL_END:
+            dump_stuck("finish-event-card", log)
+            _halt(f"{keys.label(fk)} card shows FINISH EVENT - stopped with "
+                  f"NOTHING pressed. Walk it by hand.", log)
+            return False
         if button is None:
             log(f"    events: {keys.label(fk)} focused but no button read - "
                 f"looking again")
@@ -386,10 +419,10 @@ def enter_event(log=print, tries=24):
             log(f"    events: new target {keys.label(target)}")
             continue
         if (button == "CONTINUE" and keys.level(target) > keys.max_level()):
-            # Above MUT_EVENT_MAX_LEVEL: never play it unattended.
+            # Above the overnight cap (L1/L2 only): never play it unattended.
             dump_stuck("above-max-level", log)
             _halt(f"{keys.label(target)} run is in progress but the farm is "
-                  f"capped at LV{keys.max_level()} - left for a human. To "
+                  f"capped at LV{keys.max_level()} - left for the user. To "
                   f"move on: clear 'event' in {C.STATE_FILE}, rm {C.HALT_FILE}",
                   log)
             return False
@@ -399,8 +432,8 @@ def enter_event(log=print, tries=24):
             time.sleep(3.0)
             return True
         if CURRENT_EVENT != target and os.path.exists(PAUSE_NEW_RUN):
-            # Requested stop BEFORE joining a new run (touch the file to get
-            # one). Nothing pressed on the card.
+            # Requested stop BEFORE joining a new run (practise the
+            # quit menu first). Nothing pressed on the card.
             _halt(f"paused before a NEW run ({keys.label(target)}) - "
                   f"{PAUSE_NEW_RUN} present. rm it to continue.", log)
             return False
@@ -410,6 +443,7 @@ def enter_event(log=print, tries=24):
             # confirm.
             CURRENT_EVENT = target
             SPEND_PENDING = True
+            LAST_COUNTS.pop(target, None)   # a new run starts its count at 0-0
             _record_run("started", target)
         _save_state()
         log(f"    events: {keys.label(target)} -> {button}"
@@ -425,14 +459,14 @@ def enter_event(log=print, tries=24):
 def _progress_screen(txt, log):
     """The event progress screen ("x/1 LOSSES", "x/10 WINS"). It only appears
     after a game, so it is a game boundary. Returns False to stop the loop."""
-    global SAW_FINISH_GAME
+    global SAW_FINISH_GAME, LOSSES_SEEN
     if re.search(r"\d\s*/\s*\d+\s*WINS", txt) and "LOSSES" in txt:
         if not SAW_FINISH_GAME:
             log("    progress screen = game boundary (no RETURN TO HUB was shown)")
         SAW_FINISH_GAME = True
     global CURRENT_EVENT, AWAITING_KEY_FROM, FINISHING, FINISH_WAS_LOSS
     global JUST_QUIT, LAST_COUNTS
-    # OCR reads the 0 in "0/1 LOSSES" as O or D.
+    # OCR reads the 0 in "0/1 LOSSES" as O or D (Oct 16 02:57).
     txt = re.sub(r"(?<![A-Z0-9])[ODQ](?=\s*/\s*\d)", "0", txt)
     m_w = re.search(r"(\d+)\s*/\s*(\d+)\s*WINS", txt)
     m_l = re.search(r"(\d+)\s*/\s*(\d+)\s*LOSS", txt)
@@ -449,7 +483,9 @@ def _progress_screen(txt, log):
         _record_run("quit armed", CURRENT_EVENT, progress=m_w.group(0))
     if CURRENT_EVENT and m_w and m_l:
         prog = f"{m_w.group(1)}/{m_w.group(2)} W, {m_l.group(1)}/{m_l.group(2)} L"
-        if prog != LAST_PROGRESS:
+        # ⛔ Keyed by event: an L4 "0/3 W, 1/1 L" followed by an L3 game-1
+        # loss reads identically, and the L3 loss went unrecorded (Oct 17).
+        if (CURRENT_EVENT, prog) != LAST_PROGRESS:
             # L3/L4 loop record: one game per new progress screen. A loss on
             # L4 right after our planned quit is not a real loss.
             _lv = keys.level(CURRENT_EVENT)
@@ -458,22 +494,40 @@ def _progress_screen(txt, log):
                 _pw, _pl = LAST_COUNTS.get(CURRENT_EVENT, (0, 0))
                 if _w > _pw:
                     keys.record_result(_lv, "W", f"#{CURRENT_EVENT} {prog}")
+                    if _lv == 4:
+                        keys.add_candy("L4_win", f"#{CURRENT_EVENT} {prog}")
+                    elif _w == int(m_w.group(2)):
+                        keys.add_candy("L3_complete", f"#{CURRENT_EVENT} {prog}")
                 elif _l > _pl and not JUST_QUIT:
                     keys.record_result(_lv, "L", f"#{CURRENT_EVENT} {prog}")
                 LAST_COUNTS[CURRENT_EVENT] = (_w, _l)
-            LAST_PROGRESS = prog
+            LAST_PROGRESS = (CURRENT_EVENT, prog)
             log(f"    RUN PROGRESS {keys.label(CURRENT_EVENT)}: {prog}")
             _record_run("progress", CURRENT_EVENT, progress=prog)
     if CURRENT_EVENT and m_w and m_w.group(1) == m_w.group(2) != "0":
         log(f"    *** LEVEL COMPLETE: {keys.label(CURRENT_EVENT)} "
             f"{m_w.group(0)} ***")
         _record_run("COMPLETE", CURRENT_EVENT, progress=m_w.group(0))
-        FINISHING = CURRENT_EVENT
-        if keys.level(CURRENT_EVENT) < 4:
-            AWAITING_KEY_FROM = CURRENT_EVENT
-        CURRENT_EVENT = None
-        _save_state()
-        log(f"    -> FINISH EVENT walk for #{FINISHING}")
+        if not C.PAUSE_AT_LEVEL_END:
+            FINISHING = CURRENT_EVENT
+            if keys.level(CURRENT_EVENT) < 4:
+                AWAITING_KEY_FROM = CURRENT_EVENT
+            CURRENT_EVENT = None
+            _save_state()
+            log(f"    -> FINISH EVENT walk for #{FINISHING}")
+        elif C.PAUSE_AT_LEVEL_END:
+            dump_stuck("level-complete", log)
+            _halt(f"LEVEL COMPLETE {keys.label(CURRENT_EVENT)} "
+                  f"({m_w.group(0)}) - stopped on the progress screen with "
+                  f"NOTHING pressed. Walk the rewards / FINISH EVENT by hand "
+                  f"to see where the next-level key appears.", log)
+            # The run is over; remember it so a later start does not try to
+            # continue it, and so the key is still awaited.
+            if keys.level(CURRENT_EVENT) < 4:
+                AWAITING_KEY_FROM = CURRENT_EVENT
+            CURRENT_EVENT = None
+            _save_state()
+            return False
     elif CURRENT_EVENT and m_l and m_l.group(1) == m_l.group(2) != "0":
         log(f"    *** RUN LOST: {keys.label(CURRENT_EVENT)} {m_l.group(0)} "
             f"- the key is gone ***")
@@ -485,7 +539,7 @@ def _progress_screen(txt, log):
         else:
             _alert_sticky(f"RUN LOST on {keys.label(CURRENT_EVENT)}", log)
             _record_run("LOST", CURRENT_EVENT, progress=m_l.group(0))
-        # A loss pays a key one level down (L3 loss -> L2 key, L1 -> L1): cash
+        # A loss pays a key one level down (L3 loss -> L2 key, Oct 15): cash
         # the card with FINISH EVENT and open the key pack like a completion.
         FINISHING = CURRENT_EVENT
         AWAITING_KEY_FROM = CURRENT_EVENT
@@ -501,6 +555,24 @@ def _progress_screen(txt, log):
             log("    [reward screen captured for review]")
         except Exception:
             pass
+    m_loss = re.search(r"(\d)\s*/\s*(\d)\s*LOSS", txt)
+    if m_loss and C.HALT_ON_ANY_LOSS:
+        # This is the last screen before the next game starts, so it is where
+        # a loss has to be caught. LOSSES_SEEN is persisted so that restarting
+        # after a halt does not halt again on the same loss.
+        n = int(m_loss.group(1))
+        if n > (LOSSES_SEEN or 0):
+            LOSSES_SEEN = n
+            _save_state()
+            _halt(f"LOSS - progress screen reads {m_loss.group(0)}. Farm "
+                  f"STOPPED before entering another game. To play on (a fresh "
+                  f"run): rm {C.HALT_FILE} and ./farm.sh", log)
+            return False
+        LOSSES_SEEN = n
+        _save_state()
+    elif m_loss and LOSSES_SEEN is not None:
+        LOSSES_SEEN = None
+        _save_state()
     log(f"    rewards/progress -> advancing  |RAW| {txt[:160]}")
     # Once only during a finishing walk: a second X could land on the list.
     for _ in range(1 if FINISHING else 2):
@@ -510,7 +582,7 @@ def _progress_screen(txt, log):
 
 
 # The digits on the opened card are in a display font OCR misreads as letters
-# ("100" -> "TOO"): accept look-alikes and map them back to digits.
+# ("100" -> "TOO", Oct 16): accept look-alikes and map them back to digits.
 _KEY_CARD = re.compile(r"(?<![A-Z0-9])([0-9TILODQSZB]{2,4})\s*"
                        r"(MURKWATER|CATACOMB|PHANTASMAL|ABYSSAL)")
 _DIGIT_LOOKALIKE = str.maketrans("TILODQSZB", "111000528")
@@ -544,7 +616,7 @@ def _mf_rewards(txt, log):
             return True
         if keys.level(FINISHING) == 4:
             # L4 WIN: no key in its rewards (candy + the player pack, which
-            # is left for a human to open). Stop looking and advance.
+            # the user opens). Stop looking and advance.
             log(f"    rewards: #{FINISHING} has no Event Key pack - an L4 win; "
                 f"advancing, player pack left unopened")
             AWAITING_KEY_FROM = None
@@ -560,7 +632,7 @@ def _mf_rewards(txt, log):
         + ("" if ours else " (not ours)"))
     if ours and keys.level(FINISHING) == 4:
         log(f"    rewards: #{FINISHING} final-house rewards -> advancing; "
-            f"player pack left for a human")
+            f"the user opens the player pack")
         _record_run("final rewards collected", FINISHING)
         FINISHING = None
         _save_state()
@@ -605,6 +677,7 @@ def _mf_opened_key(txt, log):
 def _quit_row_lit():
     """Brightness of the QUIT GAME row vs the rest of the pause list.
     The focused row is a light box (~180); others are dark (~25-35)."""
+    import Quartz  # noqa: F401  (screen/actions already load it)
     shot = f"{C.SHOT_DIR}/_pause.png"
     pad.shot(None, shot)
     rows = actions._rows_from(shot, {"QUIT": {"want": ("QUIT GAME",), "not": ()}})
@@ -613,7 +686,7 @@ def _quit_row_lit():
 
 def _focus_quit_game(log, tries=10):
     """UP until QUIT GAME is the lit row (UP from RESUME wraps straight to it;
-    from anywhere else UP walks up and wraps). Confirmed by two reads."""
+    from anywhere else UP walks up and wraps). Confirmed twice."""
     for i in range(tries):
         b = _quit_row_lit()
         if b >= 120:
@@ -629,7 +702,7 @@ def _focus_quit_game(log, tries=10):
 def _l4_quit(log):
     """Pause -> QUIT GAME -> "YES - EXIT TO MENU" (L4 win-one-and-quit).
 
-    The flow, as walked by hand:
+    Walked by hand Oct 16 17:35 on a #900 practice run (frames calib/q1-q3):
       OPTIONS -> pause menu, RESUME focused, QUIT GAME last; UP once WRAPS to
       QUIT GAME -> X -> popup "Quitting will give you a loss in this event",
       rows "YES - EXIT TO MENU" / "NO", NO FOCUSED BY DEFAULT -> select YES ->
@@ -745,6 +818,16 @@ def advance_menus(log=print, tries=25):
             if not enter_event(log=log):
                 return False
 
+        elif re.search(r"(?<![A-Z])LOCKED\b", txt) and (
+                _has(txt, "ACCESS RULES") or _has(txt, "HAVE AT LEAST")):
+            # The chosen lineup mode is closed to this squad (Oct 1: Lineup
+            # Restricted needs 3x 85+ OVR BO players). Retrying cannot fix
+            # it - stop and say why. The popup is left up for the user.
+            dump_stuck("lineup-locked", log)
+            _halt(f"{C.LINEUP_WANT} lineup is LOCKED - access rules not "
+                  f"met. Fix the lineup or set MUT_EVENT_LINEUP=FREE", log)
+            return False
+
         elif _has(txt, "WANT TO SPEND THIS ITEM"):
             # The key picker's confirm popup. YES is the default focus.
             ok, detail = actions.select_row(
@@ -770,7 +853,7 @@ def advance_menus(log=print, tries=25):
             # cards ("8 ITEMS FOUND"). X applies one = spends it. The count
             # is the truth: sync the ledger to it.
             # The card font reads 1 as T/I and 0 as O ("T ITEMS FOUND",
-            # "OO PHANTASMAL PLACE" for 1x #100): map look-alikes.
+            # "OO PHANTASMAL PLACE" for 1x #100, Oct 16): map look-alikes.
             m = re.search(r"(?<![A-Z0-9])([0-9TILODQSZB]{1,3})\s*ITEMS? FOUND", txt)
             n = int(m.group(1).translate(_DIGIT_LOOKALIKE)) if m else None
             want = CURRENT_EVENT
@@ -778,7 +861,10 @@ def advance_menus(log=print, tries=25):
             mk = re.search(rf"(?<![A-Z0-9])([0-9TILODQSZB]{{0,4}})\s*{house}", txt) \
                 if want else None
             got = mk.group(1).translate(_DIGIT_LOOKALIKE) if mk else None
-            if not want or mk is None or (got and got not in want):
+            # ⛔ Reject only a read that is clearly ANOTHER key's number. The
+            # card font garbles digits ("150" read as "60", Oct 17) and the
+            # picker only ever lists keys this event accepts.
+            if not want or mk is None or (got in keys.EVENTS and got != want):
                 dump_stuck("key-picker-mismatch", log)
                 _alert_sticky(f"key picker does not show #{want} keys - "
                               f"backing out", log)
@@ -810,17 +896,29 @@ def advance_menus(log=print, tries=25):
             pad.press("cross", hold=0.06)
             time.sleep(2.5)
 
-        elif _has(txt, "ENTRY OPTIONS"):
-            # Entry options with no key row read: never confirm blind.
-            dump_stuck("entry-options", log)
-            _alert_sticky(f"ENTRY OPTIONS: no key row read. NOT entering. "
-                          f"Screen dumped to {C.STUCK_DIR}.", log)
-            return False
+        elif _has(txt, "ENTRY OPTIONS") or ("LINEUP" in txt and
+                                            "RESTRICTED" in txt):
+            ok, detail = actions.choose_lineup(log=log)
+            if not ok:
+                dump_stuck("entry-options", log)
+                _alert_sticky(
+                    f"ENTRY OPTIONS: could not confirm the {C.LINEUP_WANT} "
+                    f"lineup ({detail}). NOT entering. Screen dumped to "
+                    f"{C.STUCK_DIR}.", log)
+                return False
+            log(f"    entry options -> {detail}")
 
         elif _has(txt, "HOW TO PLAY") or _has(txt, "REQUIREMENTS"):
             log("    intro -> continue")
             pad.press("cross", hold=0.06)
             time.sleep(2.5)
+
+        elif _has(txt, "FINISH EVENT") and C.PAUSE_AT_LEVEL_END:
+            dump_stuck("finish-event", log)
+            _halt("FINISH EVENT on screen - stopped with NOTHING pressed. "
+                  "Walk it by hand to see where the next-level key appears.",
+                  log)
+            return False
 
         elif _has(txt, "FINISH EVENT"):
             log("    FINISH EVENT -> collecting rewards")
@@ -870,8 +968,8 @@ def advance_menus(log=print, tries=25):
 
         elif "DISMISS ALL" in txt and ("TRICK-OR-TREAT" in txt or "EVENT KEY" in txt
                                        or "OR-TREAT" in txt or "OR- TREAT" in txt):
-            # The opened key card. Matched loosely: OCR has read TRICK-OR-TREAT
-            # as "IRICK-OR- TRE".
+            # The opened key card. Matched loosely: OCR read TRICK-OR-TREAT as
+            # "IRICK-OR- TRE" (Oct 16 18:40) and the card was closed unread.
             if not _mf_opened_key(txt, log):
                 return False
 
@@ -949,6 +1047,7 @@ class Game:
         self.partial = joined
         self.t0 = time.time()
         self.plays = 0
+        self.event = None      # the event this game was played in (set on the first play)
         self.theirs = 0
         self.ours = 0
         self.since_theirs = 0    # plays since each side last read acceptably
@@ -962,10 +1061,14 @@ class Game:
         self.seen_q4 = False     # overtime is only possible after Q4
         self.overtime = False
         self.badge = None
+        self.need_chew = True    # the chew-clock tempo must be (re-)set
         # The tempo actually set on the console: a fresh game starts on NORMAL;
         # a game joined mid-way is unknown (None) and is set on first offence.
         self.tempo = None if joined else "NORMAL"
-        self.fbd_slow = False    # the run is on its short hold (big lead)
+        self.last_side = None    # side of the last playcall we acted on
+        self.nh_seen = None      # No Huddle: when PREPLAY was first seen
+        self.nh_pressed = 0      # No Huddle: X taps sent at this line
+        self.fbd_slow = False    # the hybrid dive is on its short run
         self.skips = 0           # consecutive deliberate no-snaps
         self.layout = None       # broadcast presentation, recorded only
         self.clock_x = None
@@ -1005,7 +1108,8 @@ def _accept_score(g, which, value, log):
     since = g.since_theirs if which == "theirs" else g.since_ours
     if g.joined and not g.opp_confirmed and g.plays == 0:
         # First read of a game we JOINED (a restart): there is no previous
-        # score to jump from, so a real 31-5 would otherwise be rejected.
+        # score to jump from. Oct 16 08:50: "31" was rejected as impossible
+        # from 0, so a 31-5 lead was played as 0-5 (jet, chew off).
         log(f"    {which} score {value} - first read after joining, accepted")
         return True
 
@@ -1080,6 +1184,8 @@ def _special_teams(stamp, log):
     play = current_offense()
     log(f"[{stamp()}]   4th down: going for it -> {play['name']}")
     pad.press(play["button"], hold=C.OFF_SELECT_HOLD)
+    if play.get("settle"):
+        time.sleep(play["settle"])
     snapped, status, hint = actions.chew_and_hike(
         play["run_seq"], log=log, allow_skip=False, chew=False)
     return snapped, f"4TH DOWN GO - {status}", hint
@@ -1096,12 +1202,14 @@ def play_loop(max_plays=99999, log=print):
     dead_t0 = None
     last_play_t = time.time()
     ever_played = False        # has a playcall screen been seen at all
+    off_plays = 0              # offensive snaps this session - drives the flip
     last_game_t = time.time()
     stuck_dumped = False
     game_stall_alerted = False
     last_situation = None
     same_situation = 0
     last_clock = None
+    no_tab_streak = 0          # consecutive "playcall UI but no tab strip" reads
 
     def stamp():
         el = int(time.time() - t_run)
@@ -1112,10 +1220,15 @@ def play_loop(max_plays=99999, log=print):
         f"  snap_floor={C.MIN_SNAP_WAIT}s")
     log(f"           event={keys.label(CURRENT_EVENT) if CURRENT_EVENT else 'none yet'}"
         f"  keys: {keys.load()}")
-    log(f"           offense={C.PLAYS[C.OFFENSE_TRAILING]['name']} "
+    log(f"           offense={C.PLAYS[C.OFFENSE_TRAILING]['name']} (L1) / "
+        f"{C.PLAYS[C.OFFENSE_TRAILING_HI]['name']} (L{C.OFFENSE_HI_FROM_LEVEL}+) "
         f"until leading, then {C.PLAYS[C.OFFENSE_LEADING]['name']}"
-        + (f" (short run at +{C.FBD_SLOW_LEAD})" if C.FBD_SLOW_LEAD else "")
-        + f"  defense={C.DEF_PLAY_NAME}")
+        + (" (flipped every other play)" if C.FLIP_PLAY and C.OFFENSE.get("flip")
+           else "")
+        + (f" (short run at +{C.FBD_SLOW_LEAD})" if C.OFFENSE.get("run_seq")
+           else "")
+        + f"  defense={C.DEF_PLAY_NAME}"
+        + (" [macro]" if C.DEF_MACRO else ""))
 
     while total_plays < max_plays:
         # Stop requests (farm.sh stop) are honoured between plays, never
@@ -1170,6 +1283,50 @@ def play_loop(max_plays=99999, log=print):
         # NOT ON A PLAYCALL SCREEN
         # -------------------------------------------------------------------
         if side is None or ratio < C.CONFIDENT:
+            # ⭐ NO HUDDLE (L4 test): our offence goes straight back to the
+            # line - no playcall screen. When the last thing we called was
+            # OFFENCE and the line's PREPLAY prompt is up, tap X until it snaps.
+            # A defensive playcall in between resets last_side, so this can
+            # never fire on defence.
+            if (C.NH_LINE_TAPS and g.tempo == "NO HUDDLE"
+                    and g.last_side == "offense"):
+                try:
+                    _bar = screen.action_bar()
+                except Exception:
+                    _bar = ""
+                if "PREPLAY" in _bar:
+                    now = time.time()
+                    if g.nh_seen is None:
+                        g.nh_seen = now
+                        log(f"[{stamp()}]   NO HUDDLE: at the line")
+                    due = g.nh_seen + C.NH_SNAP_FIRST + g.nh_pressed * C.NH_SNAP_EVERY
+                    if now >= due and g.nh_pressed < 4:
+                        pad._remote_post("/focus", {})
+                        time.sleep(0.2)
+                        pad._remote_post("/press", {"buttons": ["cross"],
+                                                    "hold": C.OFF_SNAP_HOLD,
+                                                    "gap": 0.0, "focus": False})
+                        g.nh_pressed += 1
+                        log(f"[{stamp()}]   NO HUDDLE: snap tap {g.nh_pressed} "
+                            f"(+{now - g.nh_seen:.1f}s at the line)")
+                    idle_since = None
+                    last_play_t = time.time()
+                    time.sleep(0.3)
+                    continue
+                elif g.nh_seen is not None:
+                    # PREPLAY gone after our taps: the play is live.
+                    log(f"[{stamp()}]   NO HUDDLE: snapped after "
+                        f"{g.nh_pressed} tap(s), {time.time() - g.nh_seen:.1f}s "
+                        f"at the line -> {current_offense()['name']}")
+                    total_plays += 1
+                    g.plays += 1
+                    g.event = g.event or CURRENT_EVENT
+                    off_plays += 1
+                    g.nh_seen, g.nh_pressed = None, 0
+                    idle_since = None
+                    last_play_t = time.time()
+                    time.sleep(0.3)
+                    continue
             if idle_since is None:
                 idle_since = time.time()
             idle_secs = time.time() - idle_since
@@ -1216,8 +1373,17 @@ def play_loop(max_plays=99999, log=print):
                     if any(k in bar for k in ("ADD/REMOVE FAVORITE",
                                               "COACH ADJUSTMENTS", "FLIP PLAY",
                                               "PLAYCALL SUBSTITUTIONS")):
-                        log(f"[{stamp()}]   playcall UI, NO tab strip "
-                            f"-> backing out of sub-screen (moon)")
+                        # ⛔ Usually just a slow tab read on the playcall screen
+                        # itself (Oct 16): a circle there backed out of our own
+                        # selection and Madden's default play (JET SWEEP) got
+                        # snapped. Look again; only back out when it persists.
+                        no_tab_streak += 1
+                        if no_tab_streak < 3:
+                            time.sleep(0.6)
+                            continue
+                        log(f"[{stamp()}]   playcall UI, NO tab strip x"
+                            f"{no_tab_streak} -> backing out of sub-screen (moon)")
+                        no_tab_streak = 0
                         pad.press("moon", hold=0.06)
                         time.sleep(0.9)
                         idle_since = None
@@ -1244,9 +1410,9 @@ def play_loop(max_plays=99999, log=print):
                 except Exception:
                     _pp = None
                 # Madden freezes the play clock at its snap value and keeps it
-                # on screen during the play, so a long play looks like one
-                # waiting at the line. Only snap a clock that is COUNTING: a
-                # cross mid-play can land on the next playcall.
+                # on screen during the play, so a long jet sweep looks like a
+                # play waiting at the line. Only snap a clock that is COUNTING:
+                # a cross mid-play landed on the next playcall (Sep 29).
                 if (_pp is not None and _pp <= C.PRESNAP_RESCUE_AT
                         and ever_played and "ACCEPT" not in txt):
                     time.sleep(1.1)
@@ -1260,9 +1426,10 @@ def play_loop(max_plays=99999, log=print):
                         _pp = None
                 if (_pp is not None and _pp <= C.PRESNAP_RESCUE_AT
                         and "PREPLAY" not in txt):
-                    # ⛔ This once fired on a PLAYCALL screen it could not read
-                    # and cross selected + snapped the X play. Only snap when
-                    # the line's own PREPLAY prompt is on screen.
+                    # ⛔ Oct 15 23:36: after a penalty prompt this fired on a
+                    # PLAYCALL screen it could not read, and cross selected the
+                    # X play (RPO READ SCREEN in the new playbook) and snapped
+                    # it. Only snap when the line's own prompt is on screen.
                     _pp = None
                 if (_pp is not None and _pp <= C.PRESNAP_RESCUE_AT
                         and ever_played and "ACCEPT" not in txt):
@@ -1302,7 +1469,8 @@ def play_loop(max_plays=99999, log=print):
                 dead_t0 = None
                 # The game ended only if an end-of-game screen was seen (a long
                 # cutscene is not a boundary). Book it even when the menus
-                # stopped (a halt, lost menus), or the row would be lost.
+                # stopped (level-end halt, lost menus): those rows were lost
+                # twice on Oct 15.
                 ended = SAW_FINISH_GAME and g.plays > 0
                 if ended:
                     if FINAL_SCORE:
@@ -1318,6 +1486,7 @@ def play_loop(max_plays=99999, log=print):
                 if got:
                     if not ended:
                         log(f"[{stamp()}]   break handled in {menu_secs:.0f}s")
+                        g.need_chew = True
                         g.quarter = None
                     SAW_FINISH_GAME = False
                     FINAL_SCORE = None
@@ -1329,6 +1498,7 @@ def play_loop(max_plays=99999, log=print):
         # -------------------------------------------------------------------
         # ON A PLAYCALL SCREEN
         # -------------------------------------------------------------------
+        no_tab_streak = 0
         idle_since = None
         last_play_t = time.time()
         ever_played = True
@@ -1342,12 +1512,16 @@ def play_loop(max_plays=99999, log=print):
                 return total_plays
             idle_since = None
             continue
+        g.last_side = side
+        g.nh_seen, g.nh_pressed = None, 0
         if side == "specialteams":
             snapped, status, hint = _special_teams(stamp, log)
         elif side == "offense":
-            # CHEW POLICY: Level 1 chews all game. Level 2+ leaves chew OFF
-            # (NORMAL tempo, no play-clock wait) until we are WINNING, then
-            # chews; a lost lead goes back to NORMAL. Never in overtime.
+            # The chew-clock tempo: first offensive play of Q1 and of Q3. Not
+            # in overtime, where the clock running out on a tie is a loss.
+            # ⭐ CHEW POLICY (Oct 16 08:45): Level 1 chews all game.
+            # Level 2+ leaves chew OFF (NORMAL tempo, no play-clock wait) until
+            # we are WINNING, then chews; a lost lead goes back to NORMAL.
             if not g.opp_confirmed:
                 # No score yet (a fresh start or a fresh game): read it off
                 # the scorebar before choosing, not after the snap.
@@ -1366,14 +1540,16 @@ def play_loop(max_plays=99999, log=print):
             leading = g.opp_confirmed and g.ours > g.theirs
             if leading != LEADING:
                 log(f"    OFFENCE -> "
-                    f"{C.PLAYS[C.OFFENSE_LEADING if leading else C.OFFENSE_TRAILING]['name']}"
+                    f"{C.PLAYS[C.OFFENSE_LEADING if leading else trailing_key()]['name']}"
                     f" (score {g.theirs}-{g.ours}, "
                     f"{'leading' if leading else 'not leading'})")
             LEADING = leading
             lv = current_level() or 1
             chew_now = (not g.overtime) and C.CHEW_SET_TEMPO and (
                 lv <= 1 or leading)
-            want_tempo = "CHEW" if chew_now else "NORMAL"
+            want_tempo = "CHEW" if chew_now else (
+                "NO HUDDLE" if (lv in C.NO_HUDDLE_LEVELS and not leading
+                                and not g.overtime) else "NORMAL")
             if g.tempo != want_tempo:
                 try:
                     _ps_now = screen.read_clocks()[2]
@@ -1381,7 +1557,8 @@ def play_loop(max_plays=99999, log=print):
                     _ps_now = None
                 if _ps_now is not None and _ps_now < 20:
                     # A tempo change costs ~8s of play clock: not with this
-                    # little left. Try again on the next offensive play.
+                    # little left (a restart once arrived at :10 -> delay of
+                    # game). Try again on the next offensive play.
                     log(f"    tempo -> {want_tempo} deferred (play clock "
                         f":{_ps_now})")
                 else:
@@ -1391,31 +1568,47 @@ def play_loop(max_plays=99999, log=print):
                         f"{'leading' if leading else 'not leading'})")
                     if got:
                         g.tempo = want_tempo
+            # Snap floor follows the tempo actually set on the console.
+            C.MIN_SNAP_WAIT = (C.SNAP_WAIT_NO_HUDDLE if g.tempo == "NO HUDDLE"
+                               else C.SNAP_WAIT_NORMAL)
             play = current_offense()
-            # Short run while CONFIRMED ahead by FBD_SLOW_LEAD.
+            # Hybrid dive: short run while CONFIRMED ahead by FBD_SLOW_LEAD.
             if C.FBD_SLOW_LEAD and play.get("run_seq"):
                 slow = (g.opp_confirmed
                         and (g.ours - g.theirs) >= C.FBD_SLOW_LEAD)
                 if slow != g.fbd_slow:
                     g.fbd_slow = slow
-                    log(f"    RUN HOLD: lead {g.ours - g.theirs:+d} -> "
+                    log(f"    HYBRID DIVE: lead {g.ours - g.theirs:+d} -> "
                         + ("SHORT run (hold stops early)" if slow
                            else "FULL run"))
                 if slow:
                     play = dict(play, run_seq=dict(C.FBD_SLOW_RUN))
             g.offense_used = play["name"]
             # No quarter-end skipping after four in a row, and none in OT.
+            flip = (C.FLIP_PLAY and play.get("flip", False)
+                    and off_plays % 2 == 1)
             snapped, status, hint = actions.call_offense(
-                play, known=i, log=log,
+                known=i, log=log,
                 allow_skip=(g.skips < 4) and not g.overtime,
-                chew=chew_now)
+                # ⛔ Chew ALWAYS on (Oct 15 21:23: "we want chew
+                # clock always on this"). Do not gate it on the score.
+                chew=chew_now, play=play, flip=flip)
+            if snapped:
+                off_plays += 1
         else:
-            snapped, status, hint = actions.call_defense(known=i, log=log)
+            _dlv = current_level() or 1
+            _dov = C.DEF_TRAILING_BY_LEVEL.get(_dlv)
+            if _dov and not LEADING:
+                snapped, status, hint = actions.call_defense(
+                    known=i, log=log, button=_dov[0], name=_dov[1])
+            else:
+                snapped, status, hint = actions.call_defense(known=i, log=log)
         log(f"    {status}")
 
         if not snapped:
             # A deliberate no-snap or a failed navigation: no play spent.
-            # Keep a frame of a failed tab navigation.
+            # Oct 7: a failed tab navigation on a post-TD try was followed by a
+            # delay of game and a kick, with no frame to show why - keep one.
             if "could not reach" in status:
                 dump_stuck("tab-nav-failed", log)
             g.skips += 1
@@ -1455,6 +1648,7 @@ def play_loop(max_plays=99999, log=print):
 
         total_plays += 1
         g.plays += 1
+        g.event = g.event or CURRENT_EVENT
         g.since_ours += 1
         g.since_theirs += 1
 
@@ -1550,6 +1744,7 @@ def play_loop(max_plays=99999, log=print):
             if q == 3 and g.quarter is not None and g.quarter < 3:
                 # Halftime resets the tempo; set it again on the next offence.
                 log("    Q3 -> halftime reset the tempo to NORMAL")
+                g.need_chew = True
                 g.tempo = "NORMAL"
             g.quarter = q
 
@@ -1572,7 +1767,9 @@ def _end_game(g, game_no, menu_secs, stamp, log, reason="postgame"):
     if g.result == "L":
         # From the score reader, which misreads. The progress screen's
         # "x/1 LOSSES" is the truth: check it.
-        _alert_sticky(f"GAME {game_no} LOST {g.theirs}-{g.ours} by the score "
+        # Not sticky: the score reader misreads (stat ticker) and the progress
+        # screen is the truth - a real run loss raises its own sticky alert.
+        _alert(f"GAME {game_no} LOST {g.theirs}-{g.ours} by the score "
                       f"reader - check the progress screen / event record", log)
     elif g.result is None:
         log("    ! RESULT UNKNOWN from the score - leaving it for the record "
@@ -1587,7 +1784,11 @@ def _end_game(g, game_no, menu_secs, stamp, log, reason="postgame"):
         theirs=g.theirs, ours=g.ours, result=g.result,
         opp_confirmed=g.opp_confirmed, overtime=g.overtime,
         hike_at=C.HIKE_AT, snap_wait=C.MIN_SNAP_WAIT,
-        offense=g.offense_used)
+        offense=g.offense_used,
+        # ⛔ The row is written after the menus - by then a level-complete walk
+        # has already moved CURRENT_EVENT on (L3 game 3 was booked as #1988).
+        event=g.event or CURRENT_EVENT,
+        level=keys.level(g.event) if g.event else current_level())
     RECORD_AT_LAST_GAME = CURRENT_RECORD
     _save_state()
     return Game(joined=False)
@@ -1630,5 +1831,17 @@ if __name__ == "__main__":
             pass
         play_loop(max_plays=int(arg) if arg else 99999,
                   log=functools.partial(print, flush=True))
+    elif cmd == "menus":
+        print(advance_menus())
+    elif cmd == "event":
+        print(enter_event())
+    elif cmd == "lineup":
+        print(actions.choose_lineup())
+    elif cmd == "chew":
+        print("chew clock:", actions.set_chew_clock())
+    elif cmd == "off":
+        print(actions.call_offense())
+    elif cmd == "def":
+        print(actions.call_defense())
     else:
         print(__doc__)

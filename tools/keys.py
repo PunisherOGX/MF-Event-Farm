@@ -3,20 +3,19 @@
 play next.
 
 Every Trick-or-Treat event costs its own numbered key. Level 1 keys are bought
-(Candy Store); a completed level pays a random key for the next level, and a
-lost (or quit) run pays a key one level down (L1 pays L1). The farm always
-plays the HIGHEST level (<= max_level) it holds a key for, so a fresh key is
-used straight away; with no L2+ key it falls back to a bought L1 key.
+by the user (Candy Store); a completed level pays a random key for the next
+level. The farm always plays the HIGHEST level it holds a key for, so a fresh
+L2 key is used straight after L1, and so on up to the L4 final, after which it
+falls back to a bought L1 key.
 
-    ./keys.py                 show the ledger and the L3/L4 loop record
-    ./keys.py add 950 3       you bought 3x #950
+    ./keys.py                 show the ledger
+    ./keys.py add 950 3       the user bought 3x #950
     ./keys.py set 900 5       correct a count
     ./keys.py next            which event the farm would enter now
     ./keys.py log             the last 30 ledger changes
 
 The ledger is ~/.mut_mf_keys.json; every change is appended to
-~/.mut_mf_keys_log.jsonl with why. The L3/L4 loop record (one W/L per game
-on those levels) is ~/.mut_mf_loop_record.json.
+~/.mut_mf_keys_log.jsonl with who/why.
 """
 import json
 import os
@@ -58,7 +57,7 @@ DESCRIPTIONS = {
 }
 
 # Which bought L1 key to spend first when several are held. #950 pays 10 for a
-# 10+ yd rushing TD, which suits a run-only offence.
+# 10+ yd rushing TD, which suits the FB Dive used on L1.
 L1_PREFERENCE = ["950", "900", "999"]
 
 
@@ -121,10 +120,10 @@ def set_count(key, n, why="set by hand"):
 
 
 def max_level():
-    """Highest level the farm will ENTER (MUT_EVENT_MAX_LEVEL, default 4 for
-    the L3 <-> L4 loop). Earned keys above it stay in the ledger."""
+    """Highest level the farm will ENTER (Oct 15 23:50: loop L1/L2
+    overnight and bank the L3 keys). Earned keys above it stay in the ledger."""
     try:
-        return int(os.environ.get("MUT_EVENT_MAX_LEVEL", "4"))
+        return int(os.environ.get("MUT_EVENT_MAX_LEVEL", "4"))  # 4 again Oct 16 16:50: L3 <-> L4 loop (win one L4 game, quit)
     except ValueError:
         return 2
 
@@ -163,6 +162,32 @@ def record_result(level, result, note=""):
     os.replace(tmp, RECORD)
 
 
+# Candy from the loop, counted from results (the on-screen total also moves
+# with spending and other sources, so it is never read). Paid on the same
+# rewards screen as the key.
+CANDY = {"L3_complete": 2000, "L4_win": 2500}
+
+
+def add_candy(source, note=""):
+    """Count one candy payout: source is "L3_complete" or "L4_win"."""
+    try:
+        rec = json.load(open(RECORD))
+    except (OSError, ValueError):
+        return
+    c = rec.setdefault("candy", {k: 0 for k in CANDY})
+    c[source] = c.get(source, 0) + 1
+    rec.setdefault("log", []).append({"ts": time.strftime("%Y-%m-%dT%H:%M"),
+                                      "candy": source, "note": note})
+    tmp = RECORD + ".tmp"
+    json.dump(rec, open(tmp, "w"), indent=1)
+    os.replace(tmp, RECORD)
+
+
+def candy_total(rec):
+    c = rec.get("candy", {})
+    return sum(c.get(k, 0) * v for k, v in CANDY.items())
+
+
 def show():
     d = load()
     for lv in (1, 2, 3, 4):
@@ -174,6 +199,9 @@ def show():
         print("  loop record: " + "   ".join(
             f"{k} {rec[k]['W']}-{rec[k]['L']}" for k in ("L3", "L4") if k in rec)
               + f"   (since {rec.get('since', '?')[:16]})")
+        c = rec.get("candy", {})
+        print(f"  candy: {candy_total(rec):,}  ({c.get('L3_complete', 0)} L3 "
+              f"completions x 2,000 + {c.get('L4_win', 0)} L4 wins x 2,500)")
     except (OSError, ValueError, KeyError):
         pass
     print(f"  next -> {label(nxt) if nxt else 'NO KEYS - buy L1 keys'}"
@@ -185,7 +213,7 @@ if __name__ == "__main__":
     if not a:
         show()
     elif a[0] == "add" and len(a) == 3:
-        print(f"  #{a[1]} -> {change(a[1], int(a[2]), 'bought')}")
+        print(f"  #{a[1]} -> {change(a[1], int(a[2]), 'bought (user)')}")
     elif a[0] == "set" and len(a) == 3:
         print(f"  #{a[1]} -> {set_count(a[1], int(a[2]))}")
     elif a[0] == "next":

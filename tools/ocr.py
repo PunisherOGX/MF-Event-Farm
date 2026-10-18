@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Vision OCR helpers: capture a region through the pad daemon, return its text."""
+"""Vision OCR helpers. The only piece of the sniping toolchain this farm needs.
+
+⭐ Extracted deliberately. The farm previously imported `step.py` - 1,500 lines
+of auction-house sniping - for two functions. That dragged unrelated code, and
+an unrelated audit surface, into a farm that has no business buying anything.
+"""
 import os
 import sys
 
@@ -11,7 +16,9 @@ from Foundation import NSURL  # noqa: E402
 import pad  # noqa: E402
 
 OCR_MIN_H = 120       # below this height a crop counts as "short"
-# 2.5x was measured best on labelled samples (2x misread a quarter of them).
+# ⭐ 2.5x, MEASURED - not chosen for roundness. Scored against every labelled
+# sample: 1x 2/4 · 1.5x 3/4 · 2x 3/4 · 2.5x 4/4 · 3x 3/4 · 4x 3/4.
+# 2x was the first guess and is wrong on a quarter of them.
 OCR_SCALE = 2.5       # short crops
 OCR_SCALE_TALL = 1.5  # tall crops: 2x regresses on larger text
 

@@ -2,12 +2,14 @@
 # The single source of truth. Reads the PERSISTENT history, never the volatile log.
 cd "$(dirname "$0")" || exit 1
 
-# Resolve the interpreter. Order: an explicit MUT_PY, the repo's venv/ (see
-# README), a venv inside tools/, then whatever python3 is on PATH.
+# Resolve the interpreter. Order: an explicit MUT_PY, this repo's venv, then a
+# sibling qenv, then whatever python3 is on PATH.
 resolve_py() {
-  # We have already cd'd into the script's directory, so use PWD.
+  # ⛔ We have already cd'd into the script's directory, so use PWD.
+  # "$(dirname "$0")" here would resolve against the NEW cwd and point at a
+  # directory that does not exist.
   local here; here="$PWD"
-  for c in "$MUT_PY" "$here/../venv/bin/python" "$here/venv/bin/python" \
+  for c in "$MUT_PY" "$here/../venv/bin/python" "$here/qenv/bin/python" \
            "$(command -v python3)"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }
   done
@@ -15,7 +17,7 @@ resolve_py() {
 }
 PY="$(resolve_py)"
 if [ -z "$PY" ]; then
-  echo "No python found. Create the venv (see README)." >&2
+  echo "No python found. Run ./setup.sh first." >&2
   exit 1
 fi
 
@@ -72,7 +74,7 @@ else:
 PY
 echo
 echo "=== MOST FEARED: KEYS AND RUNS ==="
-"$PY" "$PWD/keys.py"
+"$PY" "$(dirname "$0")/keys.py"
 echo "  --- last 8 run events ---"
 tail -8 ~/.mut_most_feared_runs.jsonl 2>/dev/null | sed 's/^/  /' || echo "  none yet"
 echo

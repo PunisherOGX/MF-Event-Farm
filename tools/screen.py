@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Everything that READS the screen. No button ever gets pressed from here.
 
-Look at the screen; do not reason about what the code probably does. Reading
-is cheap - keep it that way and use it constantly.
+⭐ THE HABIT THIS FILE SERVES: look at the screen, do not reason about what the
+code probably does. Every long debugging session on this project came from
+describing behaviour instead of capturing a frame - and each was then solved in
+seconds by looking. Reading is cheap; keep it that way and use it constantly.
 
-⛔ NEVER shell out to `screencapture`: ~1.9s per call and frames that are
-seconds out of date. The pad daemon captures in-process in ~0.03s.
+⛔ NEVER shell out to `screencapture`. It costs ~1.9s per call - fixed overhead,
+not pixel work - and it returns frames that are SECONDS OUT OF DATE. The pad
+daemon captures in-process via CoreGraphics in ~0.03s. That one change took
+games from 32 minutes to 17.
 """
 import hashlib
 import os
@@ -65,11 +69,35 @@ def band_x(buf, w, h, bpr, bpp, x0, x1):
     return total / n if n else 0.0
 
 
+def band_y(buf, w, h, bpr, bpp, y0, y1):
+    """Mean luminance of the horizontal band [y0,y1).
+
+    ⭐ The row-wise twin of band_x, and the whole reason the entry-options
+    screen can be navigated by verification instead of by assumption: a focused
+    menu row is drawn as a light box, exactly like an active tab.
+    """
+    y0, y1 = max(0, int(y0)), min(h, int(y1))
+    total = n = 0
+    for y in range(y0, y1, 2):
+        row = y * bpr
+        for x in range(0, w, 2):
+            i = row + x * bpp
+            total += buf[i] + buf[i + 1] + buf[i + 2]
+            n += 3
+    return total / n if n else 0.0
+
+
 def box_mean(buf, w, h, bpr, bpp, x0, x1, y0, y1):
     """Mean luminance of a RECTANGLE, sampled every 2nd pixel.
 
-    Sample the BUTTON, not the row: a full-width band averages a menu
-    highlight away (a button is ~430px of a 1920px display).
+    ⛔ THIS EXISTS BECAUSE band_y WAS WRONG FOR MENU ROWS. (Measured live on the
+    ENTRY OPTIONS screen.) band_y averages the FULL WIDTH of the screen,
+    but a Madden menu button is ~430px of a 1920px-wide display - so ~78% of
+    every sample was background, and a genuinely highlighted row read 41.7
+    against an unhighlighted 43.4. The highlight was real and plainly visible in
+    the screenshot; the measurement was averaging it away.
+
+    Sample the BUTTON, not the row.
     """
     x0, x1 = max(0, int(x0)), min(w, int(x1))
     y0, y1 = max(0, int(y0)), min(h, int(y1))
@@ -100,13 +128,34 @@ def col_profile(buf, w, h, bpr, bpp):
 # OCR WITH POSITIONS
 # ---------------------------------------------------------------------------
 
-def ocr_boxes_image(img, scale=2.0):
-    """OCR an in-memory CGImage -> [{text, x0, y0, x1, y1, cx, cy, fy, conf}]
-    in pixels, top-left origin. Lets several sub-crops of ONE capture be
-    recognised without decoding the PNG again for each (the HUD reader).
+def ocr_boxes(region=None, path=None, scale=2.0):
+    """OCR a region and return WHERE each string was found.
 
-    ⛔ Vision's boundingBox is normalised with a BOTTOM-LEFT origin; the flip is
-    done here so no caller has to remember it.
+    Returns [{text, x0, y0, x1, y1, cx, cy, fy}] in PIXELS of the capture,
+    plus `fy` as a 0-1 fraction down the image. Top-left origin, like every
+    other coordinate in this project.
+
+    ⭐ WHY THIS EXISTS. `step.ocr` returns a pipe-joined string with no
+    positions, which forces every menu to be navigated by hardcoded row
+    geometry or by assuming what has focus. Assuming what had focus on the
+    entry-options screen sent ~11 tier rewards down the wrong path last event.
+    With positions we can find an option by its WORDS wherever it sits, then
+    measure whether that row is the highlighted one - so the code survives the
+    layout moving, which is exactly what the player asked for.
+
+    ⛔ Vision's boundingBox is normalised with a BOTTOM-LEFT origin. The flip is
+    done here, once, so no caller has to remember it.
+    """
+    path = path or f"{C.SHOT_DIR}/_boxes.png"
+    pad.shot(region, path)
+    return ocr_boxes_file(path, scale=scale)
+
+
+def ocr_boxes_image(img, scale=2.0):
+    """ocr_boxes against an in-memory CGImage.
+
+    ⭐ Lets several sub-crops of ONE capture be recognised without decoding the
+    PNG again for each - the HUD reader makes four passes per look.
     """
     if img is None:
         return []
@@ -139,10 +188,12 @@ def ocr_boxes_image(img, scale=2.0):
 
 
 def ocr_boxes_file(path, scale=2.0):
-    """OCR boxes (as ocr_boxes_image) for an ALREADY-CAPTURED file.
+    """ocr_boxes against an ALREADY-CAPTURED file.
 
-    A decision that compares TEXT with BRIGHTNESS must read both from the SAME
-    frame, so menu selection captures once and reads this file twice.
+    ⭐ Separated on purpose: a decision that compares TEXT with BRIGHTNESS must
+    read both from the SAME frame. Capturing twice lets the screen move between
+    them, and a menu that moved between the read and the press is precisely the
+    failure this is guarding against.
     """
     url = NSURL.fileURLWithPath_(path)
     src = Quartz.CGImageSourceCreateWithURL(url, None)
@@ -183,18 +234,26 @@ def ocr_boxes_file(path, scale=2.0):
 def screen_text():
     """Full-screen OCR as one uppercased string.
 
-    Between-game screens have no clock pressure, so they are identified by
-    their TEXT rather than by pixel geometry.
+    Between-game screens have no clock pressure, so they can afford a full
+    Vision pass and be identified by their TEXT rather than by pixel geometry.
+    That is far more robust and far easier to extend when Madden adds another
+    interstitial - and Madden keeps adding them.
     """
     try:
         txt = str(ocr.ocr(None)).upper()
     except Exception:
         return ""
-    # A stuck macOS banner ("App Background Activity ... Extensions.") can sit
-    # over the stream and make a loading screen read as "unknown". Drop it.
-    return _MAC_BANNER.sub("", txt)
+    # A stuck macOS banner ("App Background Activity ... Extensions.") sits
+    # over the stream's top-right corner. Its words made loading screens long
+    # enough to read as "unknown" -> circle pressed (Oct 15). Drop them.
+    txt = _MAC_BANNER.sub("", txt)
+    # ⛔ Vision sometimes splits a two-word title into two boxes ("YOUR |
+    # REWARDS"); the L3 key pack screen then went unrecognised and was advanced
+    # past unopened (Oct 17). Re-join the titles every handler keys on.
+    return _SPLIT_TITLE.sub(lambda m: f"{m.group(1)} {m.group(2)}", txt)
 
 
+_SPLIT_TITLE = re.compile(r"\b(YOUR)\s*\|\s*(REWARDS|PROGRESS)\b")
 _MAC_BANNER = re.compile(
     r"\|?\s*APP BACKGROUND ACTIVIT\w*.*?EXTENSIONS\.?\s*", re.S)
 
@@ -258,9 +317,11 @@ def read_both(save=None):
     ratio = (scores[i] / median) if median else 0.0
 
     if ratio >= C.CONFIDENT:
-        # Confirm this really IS a tab strip (a postgame screen can have a
-        # bright band in the right place). Only runs once the cheap brightness
-        # test passed, so it costs ~1s per play rather than per poll.
+        # Confirm this really IS a tab strip. Only runs once the cheap
+        # brightness test already passed, so it costs ~1s per PLAY rather than
+        # per poll - and it is the difference between navigating a real playcall
+        # screen and grinding forever against a postgame screen that happened to
+        # have a bright band in the right place.
         try:
             words = str(ocr.ocr(C.TABSTRIP,
                                  path=f"{C.SHOT_DIR}/tabtext.png")).upper()
@@ -301,9 +362,13 @@ def action_bar():
 def read_clocks():
     """Return (quarter, game_secs, play_secs); any element may be None.
 
-    Delegates to hud.py, which finds these by CONTENT rather than at fixed
-    coordinates (Madden's scoreboard layout changes per presentation).
-    The GAME clock runs down while the PLAY clock does: the basis for chewing.
+    ⛔ Delegates to hud.py, which finds these by CONTENT rather than at fixed
+    coordinates. Madden uses a different scoreboard layout per broadcast
+    presentation and this event cycles through them like an NFL season, so a
+    fixed crop reads bare grass in half of them. See hud.py's docstring.
+
+    ⭐ The GAME clock runs down while the PLAY clock does (measured: 1:07 -> 1:06
+    as the play clock went :26 -> :20). That is the entire basis for chewing.
     """
     import hud
     h = hud.read_clocks_fast()
@@ -319,7 +384,9 @@ def read_hud_full():
 def read_is_overtime():
     """True only if the HUD shows OT where the QUARTER belongs.
 
-    Not a text search: a loose scan false-positives (see hud.parse_hud).
+    ⛔ Not a text search. See hud.parse_hud - a loose scan matched a fragment on
+    the special-teams screen and declared overtime during a 34-5 win, which
+    silently disabled clock chewing for the rest of that game.
     """
     import hud
     try:
@@ -329,13 +396,24 @@ def read_is_overtime():
 
 
 def read_score():
-    """Return (theirs, ours) or None. The opponent is on the LEFT of the bar
-    and we are on the RIGHT; each score is paired with its own team code."""
+    """Return (theirs, ours, theirs_inferred) or None.
+
+    ⛔ The opponent is on the LEFT of the bar and we are on the RIGHT in every
+    layout seen, and each score is paired with ITS OWN team code rather than a
+    fixed x - which side of the clock they sit on is exactly what changes
+    between presentations.
+
+    ``theirs_inferred`` is kept in the tuple for the caller's sake but is now
+    always False: the zero-inference hack ("team code but no digit means 0") is
+    gone, because the reader pairs a real token with each code and simply
+    returns None when it cannot. A dropped read is now honestly unreadable
+    rather than silently reported as a shut-out.
+    """
     import hud
     h = hud.read_hud()
     if h["theirs"] is None or h["ours"] is None:
         return None
-    return h["theirs"], h["ours"]
+    return h["theirs"], h["ours"], False
 
 
 # ---------------------------------------------------------------------------
@@ -343,10 +421,19 @@ def read_score():
 # ---------------------------------------------------------------------------
 
 def read_tier_badge():
-    """"ARCADE", "COMP", or None (the difficulty badge), from full-screen OCR.
+    """"ARCADE", "COMP", or None (the difficulty badge).
 
-    It only renders during a LIVE PLAY, so None is the normal answer. Logged
-    only, never acted on.
+    ⭐ Reads the FULL SCREEN text, not a narrow crop. On the old build a 270x60
+    crop at the badge's apparent position missed it on 6 of 6 attempts while the
+    same badge showed up in full-screen OCR about half the time. The badge was
+    real; the crop was wrong.
+
+    ⛔ It only renders during a LIVE PLAY - never on the playcall screen, in
+    menus, or in cut scenes - so None is the normal answer, not a failure. Call
+    it repeatedly until it answers.
+
+    ⛔ NEVER act on a single read: it has misread before. The badge is only
+    logged, never acted on.
     """
     try:
         t = screen_text()
@@ -367,8 +454,10 @@ def read_tier_badge():
 def tempo_value():
     """Read the TEMPO value, defeating STALE frames.
 
-    Shot twice and use the second: a stale frame once read NORMAL after the
-    value had already moved to CHEW, and one more step landed on NO HUDDLE.
+    ⛔ Shot twice and use the second. A stale frame once read NORMAL after the
+    value had already moved to CHEW, so the code stepped once more - onto NO
+    HUDDLE, the exact opposite of what we want - then read the stale CHEW frame
+    and declared success.
     """
     try:
         pad.shot(C.TEMPO_VALUE, f"{C.SHOT_DIR}/_tempo.png")   # discard as stale
@@ -391,10 +480,14 @@ def tempo_label():
 # CONSOLE REACHABILITY
 # ---------------------------------------------------------------------------
 
-# ⛔ MARKERS THAT MEAN WE ARE LOOKING AT THE MAC, NOT THE PS5. After a chiaki
-# restart the stream can end up behind other windows; the daemon captures the
-# whole display, and the keycodes it sends (RETURN, BACKSPACE) are not harmless
-# in a terminal. The one failure where "keep trying" is wrong: stop instead.
+# ⛔⛔ MARKERS THAT MEAN WE ARE LOOKING AT THE MAC, NOT THE PS5.
+# After a chiaki restart the stream can end up behind other
+# windows, and the daemon captures the WHOLE DISPLAY - so the loop was reading
+# the macOS desktop and Terminal while still pressing buttons. The keycodes it
+# sends include RETURN and BACKSPACE, which in a terminal are not harmless.
+#
+# This is the one failure where "keep trying" is the wrong instinct: every press
+# goes somewhere real. Stop instead.
 MAC_MARKERS = ("TERMINAL", "FINDER", "MACINTOSH HD", "AIRDROP",
                "SHELL | EDIT", "SYSTEM SETTINGS", "SPOTLIGHT",
                "DANGEROUSLY-SKIP-PERMISSIONS", "BYPASS PERMISSIONS")
@@ -409,7 +502,10 @@ def looks_like_mac(txt):
 def console_up(host=None):
     """Is the PS5 actually reachable?
 
-    A frozen stream frame looks exactly like a loading screen, so ping.
+    ⛔ PING FIRST, EVERY TIME. A frozen stream frame looks exactly like a
+    loading screen: the console once dropped off the network and the loop logged
+    "loading/transition -> waiting" 143 times because nothing checked
+    reachability.
     """
     try:
         return subprocess.run(

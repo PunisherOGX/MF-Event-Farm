@@ -16,7 +16,7 @@ D=/tmp/mut-event
 LOG=$D/grind.log
 sticky_count() { [ -f "$D/ALERT.STICKY" ] && wc -l < "$D/ALERT.STICKY" || echo 0; }
 # grep -c prints 0 AND exits 1 when nothing matches, so "|| echo 0" produced
-# "0<newline>0" on a fresh log and broke every comparison.
+# "0<newline>0" on a fresh log and broke every comparison (Oct 2).
 games_done() { local n; n=$(grep -c "GAME [0-9]* END" "$LOG" 2>/dev/null); echo "${n:-0}"; }
 STICKY_BEFORE=$(sticky_count)
 STALE_SECS=${MUT_EVENT_STALE:-420}

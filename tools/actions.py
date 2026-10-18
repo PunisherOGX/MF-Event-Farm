@@ -56,6 +56,10 @@ def goto_tab(side, target_name, tries=3, known=None):
 # TEMPO: THE CHEW CLOCK
 # ---------------------------------------------------------------------------
 
+def set_chew_clock(tries=5, log=print):
+    return set_tempo("CHEW", tries=tries, log=log)
+
+
 def set_tempo(want="CHEW", tries=5, log=print):
     """R3 -> step TEMPO to `want` (CHEW / NORMAL), verified by two reads -> back out.
 
@@ -114,6 +118,22 @@ def _snap_and_run(run_seq, log):
     t_snap = time.time()
     pad._remote_post("/press", {"buttons": ["cross"], "hold": C.OFF_SNAP_HOLD,
                                 "gap": 0.0, "focus": False})
+    # A play the CPU runs on its own (JET SWEEP): snap and hands off.
+    if not run_seq:
+        return ""
+    head = ""
+    throw = run_seq.get("throw")
+    if throw:
+        # F PUSH SWING (Oct 15, labbed in practice): a BULLET to the F on R1,
+        # timed off the true snap instant (no re-focus in between). Held long
+        # enough to be a bullet, released before the catch.
+        time.sleep(max(0.0, (t_snap + float(throw["after"])) - time.time()))
+        t_throw = time.time()
+        pad._remote_post("/press", {"buttons": [throw["button"]],
+                                    "hold": float(throw["hold"]),
+                                    "gap": 0.0, "focus": False})
+        head = (f" + {throw['button'].upper()} bullet @{t_throw - t_snap:.2f}s "
+                f"hold {float(throw['hold']):.2f}s")
     after, hold = float(run_seq["after"]), float(run_seq["hold"])
     time.sleep(max(0.0, (t_snap + after) - time.time()))
     t_hold = time.time()
@@ -141,7 +161,7 @@ def _snap_and_run(run_seq, log):
             log(f"    ! run hold rejected: {r['error']}")
         elif r.get("reason") == "screen":
             tail = f", released by the screen at {r.get('held')}s"
-    return f" + run @{t_hold - t_snap:.2f}s hold {hold:.1f}s{tail}"
+    return f"{head} + run @{t_hold - t_snap:.2f}s hold {hold:.1f}s{tail}"
 
 
 def chew_and_hike(run_seq, log=print, allow_skip=True, chew=True):
@@ -312,7 +332,8 @@ def _clear_held_overlay(log=print):
     log(f"    ! held-button overlay on the playcall screen ({bar[:40]!r}) "
         f"- tapping {C.DEF_PLAY_BUTTON} to clear it")
     # Never tap cross here: cross is the snap button, and on the offensive
-    # playcall screen it would pick whatever play sits on X.
+    # playcall screen it would pick whatever play sits on X (Oct 2: the defence
+    # moved to cross). Every key the farm holds is square.
     for key in dict.fromkeys(k for k in ("box", C.DEF_PLAY_BUTTON) if k != "cross"):
         pad.press(key, hold=0.12)
         time.sleep(0.8)
@@ -343,15 +364,33 @@ def _ready_to_press(log):
     return None
 
 
-def call_offense(play, known=None, log=print, allow_skip=True, chew=True):
-    """FAVORITES -> check the row -> play button -> chew -> snap -> run."""
+def call_offense(known=None, log=print, allow_skip=True, chew=True, play=None,
+                 flip=False):
+    """FAVORITES -> check the row -> [flip] -> play button -> [settle] -> chew
+    -> snap -> [run]."""
     early = _ready_to_press(log)
     if early:
         return early
+    play = play or C.OFFENSE
     if not goto_tab("offense", C.OFF_TAB, known=known):
         return False, f"could not reach {C.OFF_TAB}", 0.0
     if not _play_row_ok(play, log):
         return False, "wrong favourites row - play not called", 1.0
+    if flip:
+        # Not when the play clock is nearly dead: a flipped play we get
+        # penalised for is worth less than a straight one we snap.
+        try:
+            _q, _g, _ps = screen.read_clocks()
+        except Exception:
+            _ps = None
+        if _ps is not None and _ps <= C.FLIP_MIN_CLOCK:
+            log(f"    play clock :{_ps} - skipping the flip to save the down")
+            flip = False
+    if flip:
+        # A LONE R2, before the select. R2 plus a face button is PLAYCALL
+        # SUBSTITUTIONS, a different screen.
+        pad.press("r2", hold=0.06)
+        time.sleep(0.35)
     # Confirm the tab right before pressing: a cutscene can drop us back on
     # COACH SUGGESTIONS, and the press would call whatever sits there.
     try:
@@ -364,20 +403,52 @@ def call_offense(play, known=None, log=print, allow_skip=True, chew=True):
     except Exception:
         pass
     pad.press(play["button"], hold=C.OFF_SELECT_HOLD)
+    if play.get("settle"):
+        time.sleep(play["settle"])
     snapped, status, hint = chew_and_hike(play["run_seq"], log=log,
                                           allow_skip=allow_skip, chew=chew)
-    return snapped, f"{play['name']} - {status}", hint
+    name = play["name"] + (" FLIPPED" if flip else "")
+    return snapped, f"{name} - {status}", hint
 
 
-def call_defense(known=None, log=print):
-    """FAVORITES -> the defensive play (a plain press). Nothing to snap."""
+def call_defense(known=None, log=print, button=None, name=None):
+    """FAVORITES -> the defensive play. Nothing to snap.
+    `button`/`name` override the configured play (plain press, no macro)."""
+    if button:
+        early = _ready_to_press(log)
+        if early:
+            return early
+        if not goto_tab("defense", C.DEF_TAB, known=known):
+            return False, f"could not reach {C.DEF_TAB}", 0.0
+        pad.press(button, hold=C.OFF_SELECT_HOLD)
+        return True, f"{name or button} called on {C.DEF_TAB}", 0.0
     early = _ready_to_press(log)
     if early:
         return early
     if not goto_tab("defense", C.DEF_TAB, known=known):
         return False, f"could not reach {C.DEF_TAB}", 0.0
-    pad.press(C.DEF_PLAY_BUTTON, hold=C.OFF_SELECT_HOLD)
-    return True, f"{C.DEF_PLAY_NAME} called on {C.DEF_TAB}", 0.0
+    if not C.DEF_MACRO:
+        pad.press(C.DEF_PLAY_BUTTON, hold=C.OFF_SELECT_HOLD)
+        return True, f"{C.DEF_PLAY_NAME} called on {C.DEF_TAB}", 0.0
+    # The macro: hold the play button, tap DOWN inside the hold, release. One
+    # /combo call - the daemon holds the key server-side, taps inside it, and
+    # releases in a finally. The play is selected on RELEASE.
+    try:
+        pad._remote_post("/combo", {
+            "hold": C.DEF_PLAY_BUTTON,
+            "taps": list(C.DEF_MACRO_TAPS),
+            "pre": C.DEF_MACRO_PRE,
+            "tap_hold": C.DEF_MACRO_TAP_HOLD,
+            "gap": C.DEF_MACRO_GAP,
+            "post": C.DEF_MACRO_POST,
+            "focus": True})
+    finally:
+        try:
+            pad.release()
+        except Exception:
+            pass
+    return True, (f"{C.DEF_PLAY_NAME} called on {C.DEF_TAB} [macro: hold "
+                  f"{C.DEF_PLAY_BUTTON} -> {'+'.join(C.DEF_MACRO_TAPS)}]"), 0.0
 
 
 def call_special_teams(log=print):
@@ -390,7 +461,7 @@ def call_special_teams(log=print):
 
 
 # ---------------------------------------------------------------------------
-# VERIFIED MENU SELECTION (end-of-game menu, popups)
+# VERIFIED MENU SELECTION (entry options, end-of-game menu)
 # ---------------------------------------------------------------------------
 # Find each option by its words wherever it is, measure which row is actually
 # highlighted, step toward the one we want and re-verify. A layout change makes
@@ -491,6 +562,12 @@ def select_row(spec, want, label="menu", log=print, tries=6, shot=None):
         pad.press(btn, hold=0.06)
         time.sleep(0.8)
     return False, f"gave up after {tries} attempts"
+
+
+def choose_lineup(log=print, tries=6, shot=None):
+    """Select the wanted lineup on the ENTRY OPTIONS screen."""
+    return select_row(C.LINEUP_ROWS, C.LINEUP_WANT, "entry options",
+                      log=log, tries=tries, shot=shot)
 
 
 def choose_finish_game(log=print, tries=6, shot=None):
